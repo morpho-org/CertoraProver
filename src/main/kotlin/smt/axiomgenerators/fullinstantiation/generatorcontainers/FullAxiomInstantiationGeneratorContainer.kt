@@ -34,6 +34,7 @@ import vc.data.lexpression.ChainedLExpressionTransformer
 class FullAxiomInstantiationGeneratorContainer private constructor(
     lxf: LExpressionFactory,
     private val arrayGenerator: ArrayGenerator,
+    private val hashGenerator: StorageHashAxiomGenerator,
     generators: List<AxiomGenerator>,
 ) : AxiomGeneratorContainer(lxf, generators) {
 
@@ -54,6 +55,7 @@ class FullAxiomInstantiationGeneratorContainer private constructor(
             return FullAxiomInstantiationGeneratorContainer(
                 lxf,
                 arrayGenerator,
+                hashGenerator,
                 listOf(
                     hashGenerator,
                     arrayGenerator,
@@ -67,6 +69,7 @@ class FullAxiomInstantiationGeneratorContainer private constructor(
     }
 
     override val postProcessTransformer = ChainedLExpressionTransformer(
+        hashGenerator.postProcessNoWrapTransformer,
         super.postProcessTransformer,
         arrayGenerator.postProcessArrayTransformer,
     )
