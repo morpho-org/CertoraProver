@@ -33,6 +33,8 @@ import smt.solverscript.functionsymbols.*
 import tac.Tag
 import utils.*
 import vc.data.*
+import vc.data.lexpression.ContextLExpressionTransformer
+import vc.data.lexpression.PlainLExpressionTransformer
 import vc.gen.LExpVCMetaData
 import java.math.BigInteger
 
@@ -93,12 +95,35 @@ class StorageHashAxiomGenerator(
     private val iteApps = mutableSetOf<LExpression.ApplyExpr>()
     private val storageLocs = mutableSetOf<LExpression>()
 
+    /** storage-key additions whose key is definitely hash-derived, mapped to the index of that key operand */
+    private val noWrapAdds = mutableMapOf<LExpression.ApplyExpr, Int>()
+
+    /**
+     * Emits the additions in [noWrapAdds] as plain Int additions `k +int o`, without the 2^256 modulo. Under the
+     * large-gaps model a definite storage key plus an offset never wraps, so the solver need not recover that from
+     * `base(k) != 0 => no_add_overflow(k, o)`.
+     */
+    val postProcessNoWrapTransformer: PlainLExpressionTransformer = object : ContextLExpressionTransformer() {
+        override fun applyExprPost(exp: ApplyExpr): IntermediateLExp? {
+            val keyIdx = noWrapAdds[context]
+                ?: return exp
+            val tag = (exp.f as NonSMTInterpretedFunctionSymbol.Vec.Add).tag
+            val key = exp.args[keyIdx]
+            val offset = lxf.add(tag, exp.args.filterIndexed { i, _ -> i != keyIdx })
+            return lxf.intAdd(key, offset).lift()
+        }
+    }
+
     /** the smt names of the program variables that may hold hash-derived storage keys */
     private var taintedVarNames: Set<String> = emptySet()
+
+    /** the smt names of the program variables that definitely hold hash-derived storage keys */
+    private var definiteVarNames: Set<String> = emptySet()
 
     override fun visitVCMetaData(lExpVc: LExpVCMetaData) {
         notLargeConstantsInCode = lExpVc.notLargeConstantsInCode
         taintedVarNames = taintedStorageKeyVars(lExpVc.tacProgram).mapToSet { it.smtRep }
+        definiteVarNames = definiteStorageKeyVars(lExpVc.tacProgram).mapToSet { it.smtRep }
         // show all terms of interest to the generator as if they were in the VC
         lExpVc.termsOfInterest?.forEach { visit(it, GenerateEnv()) }
         super.visitVCMetaData(lExpVc)
@@ -194,10 +219,33 @@ class StorageHashAxiomGenerator(
         }
     }
 
+    /**
+     * `e` is a hash-derived storage key on every path. Hash applications are; so are additions with
+     * exactly one tainted operand that is itself definite (and no literal offset >= [MAX_LITERAL_OFFSET]), `ite`s
+     * with two definite branches, and identifiers whose every program definition is definite.
+     */
+    private fun isDefinite(e: LExpression, taint: Taint): Boolean = when (e) {
+        is LExpression.Identifier -> e.id in definiteVarNames
+        is LExpression.ApplyExpr -> when (val f = e.f) {
+            is AxiomatizedFunctionSymbol.Hash.SimpleHashN -> f.hashFamily.requiresLargeGaps
+            is NonSMTInterpretedFunctionSymbol.Vec.Add,
+            TheoryFunctionSymbol.Vec.IntAdd -> {
+                val (keys, offsets) = e.args.partition(taint::isTainted)
+                val key = keys.singleOrNull()
+                key != null && isDefinite(key, taint) &&
+                    offsets.none { it.isNumericLiteral && it.asConst >= MAX_LITERAL_OFFSET }
+            }
+            is TheoryFunctionSymbol.Ternary.Ite -> isDefinite(e.args[1], taint) && isDefinite(e.args[2], taint)
+            else -> false
+        }
+        else -> false
+    }
+
     private fun base(arg: LExpression) = lxf.applyExp(AxiomatizedFunctionSymbol.Hash.Base, arg)
 
     override fun yield(axiomContainer: AxiomContainer) {
         val taint = Taint()
+        noWrapAdds.clear()
 
         val keccakApps = hashApps.filter { it.f.hashFamily.requiresLargeGaps }
 
@@ -339,6 +387,9 @@ class StorageHashAxiomGenerator(
             },
             description = "base(k) != 0 => no_add_overflow(k, o)"
         )
+        if (isDefinite(key, taint)) {
+            noWrapAdds[app] = app.args.indexOf(key)
+        }
     }
 
     override fun beforeScriptFreeze() {
@@ -381,24 +432,70 @@ class StorageHashAxiomGenerator(
         fun taintedStorageKeyVars(code: CoreTACProgram): Set<TACSymbol.Var> {
             val tainted = mutableSetOf<TACSymbol.Var>()
 
-            fun isTainted(e: TACExpr): Boolean = when (e) {
-                is TACExpr.Sym.Var -> e.s in tainted
-                is TACExpr.SimpleHash -> e.hashFamily.requiresLargeGaps
-                is TACExpr.Vec.Add, is TACExpr.Vec.IntAdd -> (e as TACExpr.Vec).ls.any(::isTainted)
-                is TACExpr.BinOp.Sub -> isTainted(e.o1)
-                is TACExpr.BinOp.IntSub -> isTainted(e.o1)
-                is TACExpr.TernaryExp.Ite -> isTainted(e.t) || isTainted(e.e)
-                else -> false
-            }
-
             val g = code.analysisCache.graph
             g.lcmdSequence(code.topoSortFw).forEach { (_, cmd) ->
-                if (cmd is TACCmd.Simple.AssigningCmd.AssignExpCmd && isTainted(cmd.rhs)) {
+                if (cmd is TACCmd.Simple.AssigningCmd.AssignExpCmd && isTainted(cmd.rhs, tainted)) {
                     tainted += cmd.lhs
                 }
             }
 
             return tainted
+        }
+
+        /**
+         * The program variables that hold a hash-derived storage key on every path. A variable is definite iff it has
+         * at least one definition and every definition (including non-expression ones, e.g. havocs and storage reads,
+         * which disqualify it) is a definite expression: a large-gaps hash, an addition with exactly one tainted operand
+         * that is definite and no literal offset >= [MAX_LITERAL_OFFSET], an `ite` with two definite branches, or a
+         * definite variable. Computed as a least fixpoint.
+         */
+        fun definiteStorageKeyVars(code: CoreTACProgram): Set<TACSymbol.Var> {
+            val tainted = taintedStorageKeyVars(code)
+            val defs = mutableMapOf<TACSymbol.Var, MutableList<TACExpr?>>()
+            code.analysisCache.graph.let { g -> g.lcmdSequence(code.topoSortFw) }.forEach { (_, cmd) ->
+                val lhs = cmd.getLhs()
+                    ?: return@forEach
+                defs.getOrPut(lhs) { mutableListOf() } += (cmd as? TACCmd.Simple.AssigningCmd.AssignExpCmd)?.rhs
+            }
+            val definite = mutableSetOf<TACSymbol.Var>()
+
+            fun isTaintedExp(e: TACExpr) = isTainted(e, tainted)
+
+            fun isDefiniteExp(e: TACExpr): Boolean = when (e) {
+                is TACExpr.Sym.Var -> e.s in definite
+                is TACExpr.SimpleHash -> e.hashFamily.requiresLargeGaps
+                is TACExpr.Vec.Add, is TACExpr.Vec.IntAdd -> {
+                    val (keys, offsets) = (e as TACExpr.Vec).ls.partition(::isTaintedExp)
+                    val key = keys.singleOrNull()
+                    key != null && isDefiniteExp(key) && offsets.isNotEmpty() &&
+                        offsets.none { it is TACExpr.Sym.Const && it.s.value >= MAX_LITERAL_OFFSET }
+                }
+                is TACExpr.TernaryExp.Ite -> isDefiniteExp(e.t) && isDefiniteExp(e.e)
+                else -> false
+            }
+
+            var changed = true
+            while (changed) {
+                changed = false
+                defs.forEachEntry { (v, rhss) ->
+                    if (v !in definite && v in tainted && rhss.all { it != null && isDefiniteExp(it) }) {
+                        definite += v
+                        changed = true
+                    }
+                }
+            }
+            return definite
+        }
+
+        /** `e` may evaluate to a hash-derived storage key, given the variables in [tainted] that may */
+        private fun isTainted(e: TACExpr, tainted: Set<TACSymbol.Var>): Boolean = when (e) {
+            is TACExpr.Sym.Var -> e.s in tainted
+            is TACExpr.SimpleHash -> e.hashFamily.requiresLargeGaps
+            is TACExpr.Vec.Add, is TACExpr.Vec.IntAdd -> (e as TACExpr.Vec).ls.any { isTainted(it, tainted) }
+            is TACExpr.BinOp.Sub -> isTainted(e.o1, tainted)
+            is TACExpr.BinOp.IntSub -> isTainted(e.o1, tainted)
+            is TACExpr.TernaryExp.Ite -> isTainted(e.t, tainted) || isTainted(e.e, tainted)
+            else -> false
         }
     }
 }
