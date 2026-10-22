@@ -28,6 +28,7 @@ import org.junit.jupiter.api.Test
 import smt.GenerateEnv
 import smt.axiomgenerators.AxiomContainer
 import smt.solverscript.functionsymbols.NonSMTInterpretedFunctionSymbol
+import smt.solverscript.functionsymbols.TheoryFunctionSymbol
 import smt.solverscript.functionsymbols.traverseQuant
 import smt.solverscript.LExpressionFactory
 import smt.solverscript.functionsymbols.AxiomatizedFunctionSymbol
@@ -390,6 +391,45 @@ internal class StorageHashAxiomGeneratorTest : TACBuilderAuxiliaries() {
             setOf(a, b, c, e),
             StorageHashAxiomGenerator.taintedStorageKeyVars(prog.code)
         )
+    }
+
+    /** A variable is a definite storage key if every definition is a hash, a definite key plus offsets, or an `ite`
+     * of two definite keys. One that may hold a plain number, or that is also havoced, is not. */
+    @Test
+    fun definiteStorageKeyVarsOnTac() {
+        val prog = TACProgramBuilder {
+            a assign TACExpr.SimpleHash(32.asTACExpr, listOf(gS), HashFamily.Keccack)
+            jump {
+                b assign Add(aS, 1.asTACExpr)
+                c assign Add(bS, gS)
+                d assign Ite(xS, aS, bS)
+                e assign Ite(xS, 1.asTACExpr, bS)
+                f assign Add(eS, 1.asTACExpr)
+                h assign TACExpr.SimpleHash(32.asTACExpr, listOf(gS), HashFamily.Keccack)
+                havoc(h)
+            }
+        }
+        assertEquals(
+            setOf(a, b, c, d),
+            StorageHashAxiomGenerator.definiteStorageKeyVars(prog.code)
+        )
+    }
+
+    /** An addition to a definite key becomes a plain Int addition; one to a value that may be a plain number keeps
+     * wrapping. */
+    @Test
+    fun noWrapTransformerOnlyRewritesDefiniteKeys() {
+        val lxf = LExpressionFactory()
+        val gen = StorageHashAxiomGenerator(lxf, targetTheory = MockLExpToSmtLib.niaTargetTheory)
+        gen.emptyNotLargeConstantsInCode()
+        val definite = lxf.add(lxf.keccack(lxf.makeConstant("x")), lxf.makeConstant("len"))
+        val maybe = lxf {
+            add(ite(makeConstant("c", Tag.Bool), keccack(makeConstant("x")), makeConstant("y")), litInt(1))
+        }
+        yieldedAxioms(lxf, gen, listOf(lxf { definite lt maybe }))
+        val f = { e: LExpression -> (gen.postProcessNoWrapTransformer(e) as LExpression.ApplyExpr).f }
+        assertTrue(f(definite) is TheoryFunctionSymbol.Vec.IntAdd)
+        assertTrue(f(maybe) is NonSMTInterpretedFunctionSymbol.Vec.Add)
     }
 
     /** The difference of two storage keys is a plain number, not a storage key -- `key1 - key2` may well be 0 or
