@@ -2085,6 +2085,15 @@ object Config {
         )
     )
 
+    val SplitTieBreakSeed = ConfigType.IntCmdLine(
+        -1,
+        Option(
+            "splitTieBreakSeed",
+            true,
+            "Seed for choosing among equally scored split pivots; -1 chooses by block name [default: -1]"
+        )
+    )
+
     val UnderApproxStartDepth = ConfigType.IntCmdLine(
         -1,
         Option(
