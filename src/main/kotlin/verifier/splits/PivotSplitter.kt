@@ -26,6 +26,8 @@ import utils.Color.Companion.red
 import utils.Color.Companion.yellow
 import vc.data.CoreTACProgram
 import verifier.splits.SplitAddress.Block
+import java.util.Objects
+import kotlin.random.Random
 
 private val logger = Logger(LoggerTypes.SPLIT)
 
@@ -51,10 +53,9 @@ class PivotSplitter(private val node: SplitTree.Node) : Splitter {
                 SplitHeuristicEnum.SIZE_ONLY -> SizeScorer
             }
             val (pivotResults, globalScore) = splitter.bestPivots(scorer)
-            // use the block names to give a consistent result across runs.
-            val pivotResult = pivotResults.maxBy { it.pivot.toString() }
+            val pivotResult = chooseAmongTied(pivotResults, Config.SplitTieBreakSeed.get(), address)
             logger.info {
-                "${address.red}[global=${globalScore.yellow}] --- ${pivotResult.blue}"
+                "${address.red}[global=${globalScore.yellow}] --- ${pivotResult.blue} (of ${pivotResults.size} tied)"
             }
             with(pivotResult) {
                 setChildren(
@@ -68,3 +69,16 @@ class PivotSplitter(private val node: SplitTree.Node) : Splitter {
 
 }
 
+/**
+ * Picks one of the equally scored [tied] pivots of the split at [address]. With a negative [seed], the one with the
+ * greatest block name, so the result is consistent across runs. Otherwise a random one, seeded by [seed] and [address],
+ * so the split tree varies with the seed.
+ */
+internal fun <T : DAGSplitter.Result<*, *>> chooseAmongTied(tied: List<T>, seed: Int, address: SplitAddress): T {
+    val byName = tied.sortedBy { it.pivot.toString() }
+    return if (seed < 0) {
+        byName.last()
+    } else {
+        byName.random(Random(Objects.hash(seed, address.name())))
+    }
+}
