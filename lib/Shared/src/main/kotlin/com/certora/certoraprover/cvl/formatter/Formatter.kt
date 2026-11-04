@@ -134,12 +134,22 @@ class FormatterInput private constructor(private val batches: List<Batch>) {
         val indentLiteral =  this@FormatterInput.whitespace(whitespaceCount)
 
         // trim line before linebreak
-        this.deleteIndent()
+        this.deleteBlankLine()
 
         appendLine()
         append(indentLiteral)
 
         this@FormatterInput.lineBreakRunningSum += 1
+    }
+
+    private fun StringBuilder.deleteBlankLine() {
+        val line = this.currentLine()
+        if (line.isBlank()) {
+            // keep the line through its leading separator, if any, so this still emits a blank line
+            val separatorEnd =
+                this.lastIndexOf(System.lineSeparator()).foundOrNull()?.plus(System.lineSeparator().length) ?: 0
+            this.setLength(separatorEnd)
+        }
     }
 
     private fun StringBuilder.deleteIndent() {

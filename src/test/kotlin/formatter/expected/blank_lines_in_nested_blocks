@@ -1,0 +1,19 @@
+hook Sstore executableAt[KEY bytes hookData] uint256 newValue (uint256 oldValue) {
+    if (oldValue == 0) {
+        bytes4 selector;
+
+        // a blank line inside a nested block
+        selector = 0;
+    }
+}
+
+invariant marketIsListed()
+    true
+    {
+        preserved onBuy(bytes32 marketId) with (env e) {
+            requireInvariant marketIsListed();
+
+            // a blank line inside a preserved block
+            require e.msg.sender != 0;
+        }
+    }
