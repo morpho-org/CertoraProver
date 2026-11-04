@@ -47,6 +47,7 @@ class FormatterTest {
         "two_filters",
         "long_filter",
         "many_if_predicates",
+        "blank_lines_in_nested_blocks",
         "visit_twice1",
     )
     fun compare(fileName: Path) {
